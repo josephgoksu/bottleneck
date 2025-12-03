@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -64,6 +65,8 @@ func main() {
 	// 1. Parse Flags
 	excludeOutliers := flag.Bool("exclude-outliers", false, "Exclude top and bottom 5% of outliers")
 	limit := flag.Int("limit", 100, "Max number of PRs to fetch (max 100 for GraphQL)")
+	reqTimeout := flag.Duration("timeout", 30*time.Second, "Timeout for each API request")
+	reqDelay := flag.Duration("delay", 200*time.Millisecond, "Delay between API requests to avoid rate limits")
 	flag.Parse()
 
 	args := flag.Args()
@@ -82,7 +85,7 @@ func main() {
 
 	// 2. Fetch Data
 	fmt.Printf("🔍 Fetching merged PRs for %s (limit %d)...\n", repo, *limit)
-	prs, err := fetchPRsGraphQL(owner, name, *limit)
+	prs, err := fetchPRsGraphQL(owner, name, *limit, *reqTimeout, *reqDelay)
 	if err != nil {
 		fmt.Printf("Error fetching PRs: %v\n", err)
 		os.Exit(1)
@@ -199,11 +202,16 @@ func printForecast(prs []PullRequest) {
 	fmt.Printf("   🏁 TREND:      %s %s\n", trendEmoji, trendText)
 }
 
-func fetchPRsGraphQL(owner, name string, limit int) ([]PullRequest, error) {
+func fetchPRsGraphQL(owner, name string, limit int, timeout time.Duration, delay time.Duration) ([]PullRequest, error) {
 	var allPRs []PullRequest
 	var cursor string
 
 	for len(allPRs) < limit {
+		// Rate Limit Delay
+		if len(allPRs) > 0 {
+			time.Sleep(delay)
+		}
+
 		remaining := limit - len(allPRs)
 		toFetch := 100
 		if remaining < 100 {
@@ -248,8 +256,18 @@ query {
   }
 }`, owner, name, args)
 
-		cmd := exec.Command("gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
+		// Context with Timeout
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, "gh", "api", "graphql", "-f", fmt.Sprintf("query=%s", query))
 		output, err := cmd.Output()
+
+		if ctx.Err() == context.DeadlineExceeded {
+			fmt.Fprintf(os.Stderr, "⚠️  Timeout: Request took longer than %s\n", timeout)
+			return nil, fmt.Errorf("request timed out after %v", timeout)
+		}
+
 		if err != nil {
 			if exitError, ok := err.(*exec.ExitError); ok {
 				return nil, fmt.Errorf("%s", exitError.Stderr)
