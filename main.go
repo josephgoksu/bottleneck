@@ -31,6 +31,7 @@ type GraphQLResponse struct {
 type GRPCPullRequest struct {
 	Number    int       `json:"number"`
 	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
 	MergedAt  time.Time `json:"mergedAt"`
 	Title     string    `json:"title"`
 	Additions int       `json:"additions"`
@@ -41,8 +42,18 @@ type GRPCPullRequest struct {
 	Reviews struct {
 		Nodes []struct {
 			CreatedAt time.Time `json:"createdAt"`
+			Author    struct {
+				Login string `json:"login"`
+			} `json:"author"`
 		}
 	}
+	ReviewRequests struct {
+		Nodes []struct {
+			RequestedReviewer struct {
+				Login string `json:"login"`
+			} `json:"requestedReviewer"`
+		}
+	} `json:"reviewRequests"`
 	Files struct {
 		Nodes []struct {
 			Path string `json:"path"`
@@ -53,12 +64,15 @@ type GRPCPullRequest struct {
 type PullRequest struct {
 	Number        int
 	CreatedAt     time.Time
+	UpdatedAt     time.Time
 	MergedAt      time.Time
-	FirstReviewAt *time.Time // Nil if no review
+	FirstReviewAt *time.Time
 	Author        string
 	Title         string
-	Size          int // Additions + Deletions
+	Size          int
 	FilePaths     []string
+	Reviewers     []string // Who actually reviewed
+	Requested     []string // Who is requested (for open PRs)
 }
 
 func main() {
@@ -83,131 +97,117 @@ func main() {
 	}
 	owner, name := parts[0], parts[1]
 
-	// 2. Fetch Data
+	// 2. Fetch Data (Merged PRs for Stats)
 	fmt.Printf("🔍 Fetching merged PRs for %s (limit %d)...\n", repo, *limit)
-	prs, err := fetchPRsGraphQL(owner, name, *limit, *reqTimeout, *reqDelay)
+	mergedPRs, err := fetchPRs(owner, name, *limit, "MERGED", *reqTimeout, *reqDelay)
 	if err != nil {
-		fmt.Printf("Error fetching PRs: %v\n", err)
+		fmt.Printf("Error fetching Merged PRs: %v\n", err)
 		os.Exit(1)
 	}
 
-	if len(prs) == 0 {
-		fmt.Println("No merged PRs found.")
+	// 3. Fetch Data (Open PRs for Ghosts/Stale) - Limit 100 is usually enough for active backlog
+	fmt.Printf("🔍 Fetching open PRs for analysis (limit 100)...")
+	openPRs, err := fetchPRs(owner, name, 100, "OPEN", *reqTimeout, *reqDelay)
+	if err != nil {
+		fmt.Printf("Error fetching Open PRs: %v\n", err)
+		// We continue even if open PRs fail, just to show merged stats
+	}
+
+	if len(mergedPRs) == 0 && len(openPRs) == 0 {
+		fmt.Println("No PRs found.")
 		return
 	}
 
-	// 3. Filter Outliers (Optional)
-	if *excludeOutliers {
-		originalCount := len(prs)
-		prs = filterOutliers(prs)
-		fmt.Printf("✂️  Outlier filtering active. Reduced from %d to %d PRs.\n", originalCount, len(prs))
-	}
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 4. General Stats
-	printGeneralStats(prs)
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 5. Review Efficiency
-	printReviewStats(prs)
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 6. Size Correlation (NEW)
-	printSizeAnalysis(prs)
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 7. Directory Hotspots (NEW)
-	printHotspots(prs)
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 8. Long Tail Authors (NEW)
-	printLongTailAuthors(prs)
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 9. Trend Analysis
-	printTrends(prs)
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 10. Forecast (NEW)
-	printForecast(prs)
-	fmt.Println(strings.Repeat("-", 60))
-
-	// 11. Histogram
-	printHistogram(prs)
-}
-
-func printForecast(prs []PullRequest) {
-	fmt.Println("🔮 FORECAST (Next 30 Days)")
-
-	// 1. Aggregate by Month
-	type MonthStat struct {
-		Total time.Duration
-		Count int
-	}
-	stats := make(map[string]*MonthStat)
-	var months []string
-
-	for _, pr := range prs {
-		m := pr.MergedAt.Format("2006-01")
-		if _, exists := stats[m]; !exists {
-			stats[m] = &MonthStat{}
-			months = append(months, m)
+	// --- Merged PR Analysis ---
+	if len(mergedPRs) > 0 {
+		// Filter Outliers (Optional)
+		if *excludeOutliers {
+			originalCount := len(mergedPRs)
+			mergedPRs = filterOutliers(mergedPRs)
+			fmt.Printf("✂️  Outlier filtering active. Reduced from %d to %d PRs.\n", originalCount, len(mergedPRs))
 		}
-		stats[m].Total += pr.MergedAt.Sub(pr.CreatedAt)
-		stats[m].Count++
-	}
-	sort.Strings(months)
+		fmt.Println(strings.Repeat("-", 60))
 
-	// Need at least 3 months of data for a trend
-	if len(months) < 3 {
-		fmt.Println("   (Not enough data for a reliable forecast. Need 3+ months.)")
-		return
-	}
+		printGeneralStats(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
+		printReviewStats(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
+		printSizeAnalysis(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
+		printHotspots(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
+		printLongTailAuthors(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
+		printTrends(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
+		printForecast(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
+		printHistogram(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
 
-	// 2. Take last 3 months
-	last3 := months[len(months)-3:]
-	var totalAvg time.Duration
-
-	fmt.Println("   Based on last 3 months:")
-	for _, m := range last3 {
-		s := stats[m]
-		avg := s.Total / time.Duration(s.Count)
-		totalAvg += avg
-		fmt.Printf("   - %s: %s\n", m, humanizeDuration(avg))
-	}
-
-	// 3. Moving Average
-	forecast := totalAvg / 3
-
-	// 4. Simple slope check (Are we getting worse?)
-	first := stats[last3[0]].Total / time.Duration(stats[last3[0]].Count)
-	last := stats[last3[2]].Total / time.Duration(stats[last3[2]].Count)
-
-	trendEmoji := "➡️"
-	trendText := "Stable"
-
-	// Threshold: 10% change
-	diff := last - first
-	threshold := first / 10
-
-	if diff > threshold {
-		trendEmoji = "📉"
-		trendText = "Slowing Down"
-	} else if diff < -threshold {
-		trendEmoji = "📈"
-		trendText = "Speeding Up"
+		// NEW: Hero Syndrome (Uses Merged Data)
+		printHeroAnalysis(mergedPRs)
+		fmt.Println(strings.Repeat("-", 60))
 	}
 
-	fmt.Printf("\n   🎯 PREDICTION: ~%s / PR\n", humanizeDuration(forecast))
-	fmt.Printf("   🏁 TREND:      %s %s\n", trendEmoji, trendText)
+	// --- Open PR Analysis ---
+	if len(openPRs) > 0 {
+		// NEW: Stale PRs
+		printStaleAnalysis(openPRs)
+		fmt.Println(strings.Repeat("-", 60))
+
+		// NEW: Ghost Reviewers
+		printGhostAnalysis(openPRs)
+		fmt.Println(strings.Repeat("-", 60))
+	}
 }
 
-func fetchPRsGraphQL(owner, name string, limit int, timeout time.Duration, delay time.Duration) ([]PullRequest, error) {
+// Generic Fetch Function for both OPEN and MERGED
+func fetchPRs(owner, name string, limit int, state string, timeout time.Duration, delay time.Duration) ([]PullRequest, error) {
 	var allPRs []PullRequest
 	var cursor string
 
+	// GraphQL Query Template
+	// We fetch reviews (for heroes) and reviewRequests (for ghosts)
+	queryTmpl := `
+query {
+  repository(owner: "%s", name: "%s") {
+    pullRequests(%s) {
+      nodes {
+        number
+        createdAt
+        updatedAt
+        mergedAt
+        title
+        additions
+        deletions
+        author { login }
+        reviews(first: 10) {
+          nodes {
+            createdAt
+            author { login }
+          }
+        }
+        reviewRequests(first: 10) {
+          nodes {
+            requestedReviewer {
+              ... on User { login }
+            }
+          }
+        }
+        files(first: 5) {
+          nodes { path }
+        }
+      }
+      pageInfo {
+        hasNextPage
+        endCursor
+      }
+    }
+  }
+}`
+
 	for len(allPRs) < limit {
-		// Rate Limit Delay
 		if len(allPRs) > 0 {
 			time.Sleep(delay)
 		}
@@ -218,45 +218,19 @@ func fetchPRsGraphQL(owner, name string, limit int, timeout time.Duration, delay
 			toFetch = remaining
 		}
 
-		args := fmt.Sprintf("first: %d, states: MERGED, orderBy: {field: CREATED_AT, direction: DESC}", toFetch)
+		// Order by Created DESC for Merged, Updated DESC for Open (usually better for stale checks)
+		orderBy := "CREATED_AT"
+		if state == "OPEN" {
+			orderBy = "UPDATED_AT"
+		}
+
+		args := fmt.Sprintf("first: %d, states: %s, orderBy: {field: %s, direction: DESC}", toFetch, state, orderBy)
 		if cursor != "" {
 			args += fmt.Sprintf(`, after: "%s"`, cursor)
 		}
 
-		query := fmt.Sprintf(`
-query {
-  repository(owner: "%s", name: "%s") {
-    pullRequests(%s) {
-      nodes {
-        number
-        createdAt
-        mergedAt
-        title
-        additions
-        deletions
-        author {
-          login
-        }
-        reviews(first: 1) {
-          nodes {
-            createdAt
-          }
-        }
-        files(first: 10) {
-          nodes {
-            path
-          }
-        }
-      }
-      pageInfo {
-        hasNextPage
-        endCursor
-      }
-    }
-  }
-}`, owner, name, args)
+		query := fmt.Sprintf(queryTmpl, owner, name, args)
 
-		// Context with Timeout
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 
@@ -264,14 +238,9 @@ query {
 		output, err := cmd.Output()
 
 		if ctx.Err() == context.DeadlineExceeded {
-			fmt.Fprintf(os.Stderr, "⚠️  Timeout: Request took longer than %s\n", timeout)
 			return nil, fmt.Errorf("request timed out after %v", timeout)
 		}
-
 		if err != nil {
-			if exitError, ok := err.(*exec.ExitError); ok {
-				return nil, fmt.Errorf("%s", exitError.Stderr)
-			}
 			return nil, err
 		}
 
@@ -289,18 +258,41 @@ query {
 			pr := PullRequest{
 				Number:    node.Number,
 				CreatedAt: node.CreatedAt,
+				UpdatedAt: node.UpdatedAt,
 				MergedAt:  node.MergedAt,
 				Author:    node.Author.Login,
 				Title:     node.Title,
 				Size:      node.Additions + node.Deletions,
 			}
+
+			// Process Reviews
 			if len(node.Reviews.Nodes) > 0 {
+				// First review time
 				t := node.Reviews.Nodes[0].CreatedAt
 				pr.FirstReviewAt = &t
+
+				// Collect Reviewers
+				seen := make(map[string]bool)
+				for _, r := range node.Reviews.Nodes {
+					if r.Author.Login != "" && r.Author.Login != pr.Author && !seen[r.Author.Login] {
+						pr.Reviewers = append(pr.Reviewers, r.Author.Login)
+						seen[r.Author.Login] = true
+					}
+				}
 			}
+
+			// Process Requested Reviewers
+			for _, req := range node.ReviewRequests.Nodes {
+				if req.RequestedReviewer.Login != "" {
+					pr.Requested = append(pr.Requested, req.RequestedReviewer.Login)
+				}
+			}
+
+			// Process Files
 			for _, f := range node.Files.Nodes {
 				pr.FilePaths = append(pr.FilePaths, f.Path)
 			}
+
 			allPRs = append(allPRs, pr)
 		}
 
@@ -313,13 +305,145 @@ query {
 	return allPRs, nil
 }
 
+// --- Stats Functions ---
+
+func printHeroAnalysis(prs []PullRequest) {
+	fmt.Println("🦸 HERO SYNDROME DETECTOR")
+	fmt.Println("   • Concept: Identifies developers reviewing a disproportionate amount of code.")
+	fmt.Println("   • Why:     Heroes are single points of failure. If they leave or burn out, velocity crashes.")
+	fmt.Println("")
+
+	reviewCounts := make(map[string]int)
+	totalReviews := 0
+
+	for _, pr := range prs {
+		for _, reviewer := range pr.Reviewers {
+			reviewCounts[reviewer]++
+			totalReviews++
+		}
+	}
+
+	if totalReviews == 0 {
+		fmt.Println("   No reviews found in this dataset.")
+		return
+	}
+
+	// Sort
+	type Reviewer struct {
+		Name  string
+		Count int
+	}
+	var heroes []Reviewer
+	for name, count := range reviewCounts {
+		heroes = append(heroes, Reviewer{name, count})
+	}
+	sort.Slice(heroes, func(i, j int) bool { return heroes[i].Count > heroes[j].Count })
+
+	// Check for heroes (>30% of total reviews is usually a warning sign, >50% is critical)
+	foundRisk := false
+	for _, h := range heroes {
+		percentage := float64(h.Count) / float64(totalReviews) * 100
+
+		if percentage > 20.0 { // Lower threshold to show top contributors generally
+			riskLevel := ""
+			if percentage > 50 {
+				riskLevel = "🚨 CRITICAL RISK"
+				foundRisk = true
+			} else if percentage > 30 {
+				riskLevel = "⚠️  High Load"
+				foundRisk = true
+			} else {
+				riskLevel = "✅ Healthy"
+			}
+
+			fmt.Printf("   %s: %d reviews (%.1f%%) - %s\n", h.Name, h.Count, percentage, riskLevel)
+		}
+	}
+
+	if !foundRisk {
+		fmt.Println("   ✅ Load is well-distributed. No single reviewer is a bottleneck.")
+	}
+}
+
+func printStaleAnalysis(prs []PullRequest) {
+	fmt.Println("📉 STALE PR DETECTOR (The Graveyard)")
+	fmt.Println("   • Concept: Open PRs that haven't been touched in >7 days.")
+	fmt.Println("   • Why:     Stale PRs rot, cause conflicts, and discourage the team.")
+	fmt.Println("")
+
+	now := time.Now()
+	staleThreshold := 7 * 24 * time.Hour
+	staleCount := 0
+
+	for _, pr := range prs {
+		if now.Sub(pr.UpdatedAt) > staleThreshold {
+			staleCount++
+			days := int(now.Sub(pr.UpdatedAt).Hours() / 24)
+			fmt.Printf("   💀 #%d (%s) by %s - %d days inactive\n", pr.Number, limitString(pr.Title, 40), pr.Author, days)
+		}
+	}
+
+	if staleCount == 0 {
+		fmt.Println("   ✅ Clean board! No stale PRs found.")
+	} else {
+		fmt.Printf("\n   Action: Ping these authors or close the PRs.\n")
+	}
+}
+
+func printGhostAnalysis(prs []PullRequest) {
+	fmt.Println("👻 GHOST REVIEWER DETECTOR")
+	fmt.Println("   • Concept: Reviewers requested >48h ago who haven't responded.")
+	fmt.Println("   • Why:     Silent blocking. The PR owner is waiting for a notification that never comes.")
+	fmt.Println("")
+
+	now := time.Now()
+	ghostThreshold := 48 * time.Hour
+
+ghosts := make(map[string]int)
+
+	for _, pr := range prs {
+		// Only check PRs that are older than 48h, otherwise the request is fresh
+		if now.Sub(pr.CreatedAt) > ghostThreshold {
+			for _, reviewer := range pr.Requested {
+				// Simple logic: If you are still in "Requested", you haven't reviewed yet.
+				// (GitHub moves you from Requested -> Reviews once you submit)
+				ghosts[reviewer]++
+			}
+		}
+	}
+
+	if len(ghosts) == 0 {
+		fmt.Println("   ✅ No ghosts found. Everyone is responding (or PRs are new).")
+		return
+	}
+
+	// Sort
+	var names []string
+	for n := range ghosts {
+		names = append(names, n)
+	}
+	sort.Slice(names, func(i, j int) bool { return ghosts[names[i]] > ghosts[names[j]] })
+
+	for _, name := range names {
+		count := ghosts[name]
+		fmt.Printf("   👻 %s: Blocking %d PRs (>48h)\n", name, count)
+	}
+}
+
+func limitString(s string, max int) string {
+	if len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
+}
+
+// --- Existing Analysis Functions (Preserved) ---
+
 func filterOutliers(prs []PullRequest) []PullRequest {
 	if len(prs) < 4 {
 		return prs
 	}
-	sort.Slice(prs, func(i, j int) bool {
-		return prs[i].MergedAt.Sub(prs[i].CreatedAt) < prs[j].MergedAt.Sub(prs[j].CreatedAt)
-	})
+	sort.Slice(prs, func(i, j int) bool { return prs[i].MergedAt.Sub(prs[i].CreatedAt) < prs[j].MergedAt.Sub(prs[j].CreatedAt) })
 	cut := int(float64(len(prs)) * 0.05)
 	if cut == 0 {
 		cut = 1
@@ -349,7 +473,10 @@ func printGeneralStats(prs []PullRequest) {
 	}
 
 	fmt.Println("📊 GENERAL STATISTICS")
-	fmt.Println("   (Time from PR Creation -> Merge)")
+	fmt.Println("   • Concept: Measures the total lifecycle of a Pull Request from creation to merge.")
+	fmt.Println("   • Why:     High average vs median indicates outliers dragging the team down. This is your baseline velocity.")
+	fmt.Println("")
+
 	fmt.Printf("   Count:   %d\n", len(prs))
 	fmt.Printf("   Average: %s\n", humanizeDuration(avg))
 	fmt.Printf("   Median:  %s\n", humanizeDuration(median))
@@ -379,6 +506,10 @@ func printReviewStats(prs []PullRequest) {
 	}
 
 	fmt.Println("🚦 REVIEW EFFICIENCY")
+	fmt.Println("   • Concept: Splits time into 'Waiting for Review' vs 'Active Review Process'.")
+	fmt.Println("   • Why:     Helps distinguish between a Triage problem (ignoring PRs) and a Complexity problem (hard to approve).")
+	fmt.Println("")
+
 	if countWait == 0 {
 		fmt.Println("   No reviews detected (Direct merges?).")
 	} else {
@@ -389,10 +520,11 @@ func printReviewStats(prs []PullRequest) {
 	}
 }
 
-// NEW: Regression Analysis (Size vs Time)
 func printSizeAnalysis(prs []PullRequest) {
 	fmt.Println("📐 SIZE vs SPEED ANALYSIS")
-	fmt.Println("   (Does the size of a PR affect how fast it merges?)")
+	fmt.Println("   • Concept: Correlation between lines of code changed and merge duration.")
+	fmt.Println("   • Why:     Determines if 'Big PRs' are the bottleneck or if the process is slow regardless of size.")
+	fmt.Println("")
 
 	var sumX, sumY, sumXY, sumX2, sumY2 float64
 	n := float64(len(prs))
@@ -408,7 +540,6 @@ func printSizeAnalysis(prs []PullRequest) {
 		sumY2 += duration * duration
 	}
 
-	// Pearson Correlation Coefficient
 	numerator := n*sumXY - sumX*sumY
 	denominator := math.Sqrt((n*sumX2 - sumX*sumX) * (n*sumY2 - sumY*sumY))
 
@@ -434,9 +565,11 @@ func printSizeAnalysis(prs []PullRequest) {
 	}
 }
 
-// NEW: Hotspot Map
 func printHotspots(prs []PullRequest) {
 	fmt.Println("🔥 DIRECTORY HOTSPOTS (Avg Merge Time)")
+	fmt.Println("   • Concept: Average merge time grouped by root directory.")
+	fmt.Println("   • Why:     Identifies parts of the codebase that are 'swamps'—hard to review, prone to debate, or lacking owners.")
+	fmt.Println("")
 
 	type DirStat struct {
 		TotalDuration time.Duration
@@ -449,14 +582,12 @@ func printHotspots(prs []PullRequest) {
 		duration := pr.MergedAt.Sub(pr.CreatedAt)
 
 		for _, path := range pr.FilePaths {
-			// Extract root directory (e.g., "pkg/api/foo.go" -> "pkg")
 			parts := strings.Split(path, "/")
 			root := parts[0]
 			if len(parts) == 1 {
 				root = "(root files)"
 			}
 
-			// Avoid double counting the same directory for the same PR
 			if !seenDirs[root] {
 				if _, exists := stats[root]; !exists {
 					stats[root] = &DirStat{}
@@ -473,35 +604,28 @@ func printHotspots(prs []PullRequest) {
 		dirs = append(dirs, d)
 	}
 
-	// Sort by Average Duration DESC
-	sort.Slice(dirs, func(i, j int) bool {
-		d1 := stats[dirs[i]]
-		d2 := stats[dirs[j]]
-		return (d1.TotalDuration / time.Duration(d1.Count)) > (d2.TotalDuration / time.Duration(d2.Count))
-	})
+	sort.Slice(dirs, func(i, j int) bool { return (stats[dirs[i]].TotalDuration / time.Duration(stats[dirs[i]].Count)) > (stats[dirs[j]].TotalDuration / time.Duration(stats[dirs[j]].Count)) })
 
 	for i, d := range dirs {
 		if i >= 5 {
 			break
-		} // Top 5
+		}
 		s := stats[d]
 		avg := s.TotalDuration / time.Duration(s.Count)
 		fmt.Printf("   %-20s: %s (avg over %d PRs)\n", d, humanizeDuration(avg), s.Count)
 	}
 }
 
-// NEW: Long Tail Authors
 func printLongTailAuthors(prs []PullRequest) {
 	fmt.Println("🐌 LONG TAIL CONTRIBUTORS (Handling the Slowest 10%)")
+	fmt.Println("   • Concept: Authors frequently found in the slowest 10% of merges.")
+	fmt.Println("   • Why:     These devs might be tackling the hardest problems, or they need help breaking down tasks. Prevents burnout.")
+	fmt.Println("")
 
-	// Sort by duration DESC
 	sortedPRs := make([]PullRequest, len(prs))
 	copy(sortedPRs, prs)
-	sort.Slice(sortedPRs, func(i, j int) bool {
-		return sortedPRs[i].MergedAt.Sub(sortedPRs[i].CreatedAt) > sortedPRs[j].MergedAt.Sub(sortedPRs[j].CreatedAt)
-	})
+	sort.Slice(sortedPRs, func(i, j int) bool { return sortedPRs[i].MergedAt.Sub(sortedPRs[i].CreatedAt) > sortedPRs[j].MergedAt.Sub(sortedPRs[j].CreatedAt) })
 
-	// Take top 10% slowest
 	limit := len(prs) / 10
 	if limit == 0 {
 		limit = 1
@@ -513,7 +637,6 @@ func printLongTailAuthors(prs []PullRequest) {
 		authorCounts[pr.Author]++
 	}
 
-	// Sort authors by occurrences in the "slow bucket"
 	var authors []string
 	for a := range authorCounts {
 		authors = append(authors, a)
@@ -531,6 +654,9 @@ func printLongTailAuthors(prs []PullRequest) {
 
 func printTrends(prs []PullRequest) {
 	fmt.Println("📈 MONTHLY TRENDS")
+	fmt.Println("   • Concept: Monthly average merge times over the requested period.")
+	fmt.Println("   • Why:     Spot if the team is getting faster (🚀) or bogging down (🐢) over time.")
+	fmt.Println("")
 
 	type MonthStats struct {
 		TotalDuration time.Duration
@@ -571,8 +697,73 @@ func printTrends(prs []PullRequest) {
 	}
 }
 
+func printForecast(prs []PullRequest) {
+	fmt.Println("🔮 FORECAST (Next 30 Days)")
+	fmt.Println("   • Concept: A 3-month moving average projection of merge times.")
+	fmt.Println("   • Why:     Predicts where your velocity is heading if current habits continue.")
+	fmt.Println("")
+
+	type MonthStat struct {
+		Total time.Duration
+		Count int
+	}
+	stats := make(map[string]*MonthStat)
+	var months []string
+
+	for _, pr := range prs {
+		m := pr.MergedAt.Format("2006-01")
+		if _, exists := stats[m]; !exists {
+			stats[m] = &MonthStat{}
+			months = append(months, m)
+		}
+		stats[m].Total += pr.MergedAt.Sub(pr.CreatedAt)
+		stats[m].Count++
+	}
+	sort.Strings(months)
+
+	if len(months) < 3 {
+		fmt.Println("   (Not enough data for a reliable forecast. Need 3+ months.)")
+		return
+	}
+
+	last3 := months[len(months)-3:]
+	var totalAvg time.Duration
+
+	fmt.Println("   Based on last 3 months:")
+	for _, m := range last3 {
+		s := stats[m]
+		avg := s.Total / time.Duration(s.Count)
+		totalAvg += avg
+		fmt.Printf("   - %s: %s\n", m, humanizeDuration(avg))
+	}
+
+	forecast := totalAvg / 3
+	first := stats[last3[0]].Total / time.Duration(stats[last3[0]].Count)
+	last := stats[last3[2]].Total / time.Duration(stats[last3[2]].Count)
+
+	trendEmoji := "➡️"
+	trendText := "Stable"
+
+	diff := last - first
+	threshold := first / 10
+
+	if diff > threshold {
+		trendEmoji = "📉"
+		trendText = "Slowing Down"
+	} else if diff < -threshold {
+		trendEmoji = "📈"
+		trendText = "Speeding Up"
+	}
+
+	fmt.Printf("\n   🎯 PREDICTION: ~%s / PR\n", humanizeDuration(forecast))
+	fmt.Printf("   🏁 TREND:      %s %s\n", trendEmoji, trendText)
+}
+
 func printHistogram(prs []PullRequest) {
 	fmt.Println("📊 MERGE TIME DISTRIBUTION")
+	fmt.Println("   • Concept: Distribution of merge times into buckets.")
+	fmt.Println("   • Why:     Averages lie. This reveals the 'long tail' of stuck PRs that frustrate the team.")
+	fmt.Println("")
 
 	buckets := []struct {
 		Label string
